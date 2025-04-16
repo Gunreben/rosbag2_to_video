@@ -38,48 +38,8 @@ def cv2_video_writer_fourcc(codec_str: str) -> int:
         raise ValueError(f'codecs should be specified using fourcc, got "{codec_str}"')
     try:
         return cv2.VideoWriter.fourcc(*codec_str)
-    except Exception:
-        raise ValueError(f'"{codec_str}" is not a valid fourcc codec')
-
-
-def add_arguments_to_parser(argparser: 'ArgumentParser'):
-    """Define command line arguments for the bag to video tool."""
-    argparser.add_argument(
-        'bagfile',
-        help='Path to the bag'
-    )
-    argparser.add_argument(
-        '-t',
-        '--topic',
-        required=True,
-        help=(
-            'Name of the image topic (currently only supports sensor_msgs/msg/Image or '
-            'sensor_msgs/msg/CompressedImage types)')
-    )
-    argparser.add_argument(
-        '-o',
-        '--output',
-        required=True,
-        help='Output filename. If not extension is provided, .mp4 is added.'
-    )
-    argparser.add_argument('--fps', type=float, required=True, help='Output frames per second')
-    argparser.add_argument(
-        '--storage-id',
-        type=str,
-        default='sqlite3',
-        help='Rosbag2 storage id. If a bag folder is provided, this is ignored.')
-    codec_group = argparser.add_mutually_exclusive_group()
-    codec_group.add_argument(
-        '--codec', type=cv2_video_writer_fourcc, default='avc1',
-        help=(
-            'Video codec fourcc. List of fourcc can be seen in http://mp4ra.org/#/codecs. '
-            'ffmpeg does not follow exactly that list, use --codec-dialog to see what is available'
-        ))
-    argparser.add_argument(
-        '--codec-dialog', action='store_true',
-        help=(
-            'Open video codec dialog. In some platforms, this will only print the available '
-            'fourcc options (which depend on the file format chosen).'))
+    except Exception as e:
+        raise ValueError(f'"{codec_str}" is not a valid fourcc codec: {e}')
 
 
 class CommandInputError(ValueError):
@@ -100,10 +60,10 @@ def get_topic_type(topic_name: str, topics_and_types) -> str:
     try:
         topic_type = next(x for x in topics_and_types if x.name == topic_name).type
     except StopIteration:
-        raise CommandInputError(
+        raise ValueError(
             f'Topic {topic_name} was not recorded in the bagfile')
     if topic_type not in ('sensor_msgs/msg/Image', 'sensor_msgs/msg/CompressedImage'):
-        raise CommandInputError(
+        raise ValueError(
             'topic type should be sensor_msgs/msg/Image or '
             f'sensor_msgs/msg/CompressedImage, got {topic_type}')
     return topic_type
@@ -283,42 +243,117 @@ def create_sequential_video_writer(
 
 
 def convert_bag_to_video(
-    bag_path: str, storage_id: str, topic_name: str, output_path: str, codec: int, fps: float
+    bag_path: str, topic_name: str, output_path: str, codec: int, fps: float,
+    storage_id: str = '' # Add storage_id as optional, derive if not provided
 ):
-    """Create a bagfile from a video."""
-    # Force the .mp4 extension on file output name
-    if pathlib.PurePath(output_path).suffix == '':
-        output_path += '.mp4'
-    image_reader = create_sequential_image_bag_reader(bag_path, storage_id, topic_name)
-    cv_image, start_stamp = image_reader.get_next()
-    video_writer = create_sequential_video_writer(output_path, codec, fps, cv_image, start_stamp)
+    """
+    Convert image sequence from a rosbag topic into a video file.
 
-    while image_reader.has_next():
-        cv_image, stamp = image_reader.get_next()
-        video_writer.add_frame(cv_image, stamp)
-    video_writer.close()
+    :param bag_path: Path to the bagfile (folder with metadata or file).
+    :param topic_name: Name of the image topic.
+    :param output_path: Path to the output video file.
+    :param codec: OpenCV FourCC integer code for the video codec.
+    :param fps: Frames per second for the output video.
+    :param storage_id: Rosbag2 storage id (e.g., 'sqlite3'). If empty, attempts to derive.
+    :raises ValueError: If inputs are invalid, topic not found/supported, or codec issues.
+    :raises Exception: For underlying issues during bag reading or video writing.
+    """
+    output_path = pathlib.Path(output_path)
+    if not output_path.parent.exists():
+         output_path.parent.mkdir(parents=True)
+    elif output_path.exists():
+         print(f'Output file {output_path} already exists, overwriting', file=sys.stderr)
+         output_path.unlink()
+
+    # --- Setup Bag Reader --- (Adapted from create_sequential_image_bag_reader)
+    bag_file_path = pathlib.Path(bag_path)
+    actual_storage_id = storage_id
+    if bag_file_path.is_dir():
+        metadata_file = bag_file_path / 'metadata.yaml'
+        if not metadata_file.is_file():
+             raise ValueError(f"Bag directory does not contain metadata.yaml: {bag_path}")
+        # Attempt to load storage id from metadata.yaml if not provided
+        if not actual_storage_id:
+            # Requires PyYAML, let's keep it simple for now and require storage_id if path is dir
+            # Or just assume sqlite3 if it's a dir and storage_id not given?
+            # For now, let's keep the logic as it was: derive from metadata if possible
+            # storage_options will handle this using default discovery if storage_id is empty
+             pass
+        storage_options = rosbag2_py.StorageOptions(uri=bag_path, storage_id=actual_storage_id)
+    elif bag_file_path.is_file():
+        if not actual_storage_id:
+            # If it's a file, user *must* provide storage_id (or default works?)
+            # Let's default to sqlite3 if not provided and it's a file path
+            actual_storage_id = 'sqlite3'
+            print(f"Assuming storage_id='{actual_storage_id}' for bag file: {bag_path}", file=sys.stderr)
+        storage_options = rosbag2_py.StorageOptions(uri=bag_path, storage_id=actual_storage_id)
+    else:
+        raise ValueError(f"Bag path is not a valid file or directory: {bag_path}")
+
+    converter_options = rosbag2_py.ConverterOptions(
+        input_serialization_format='cdr', output_serialization_format='cdr')
+    bag_reader = rosbag2_py.SequentialReader()
+    try:
+        bag_reader.open(storage_options, converter_options)
+    except Exception as e:
+        raise RuntimeError(f"Failed to open bag: {e}") # More specific error
+
+    try:
+        # This implicitly checks topic existence and type via get_topic_type
+        image_reader = SequentialImageBagReader(bag_reader, topic_name)
+    except ValueError as e:
+        # Clean up reader if topic validation fails
+        del bag_reader
+        raise e # Re-raise the ValueError (topic not found/invalid type)
+
+    if not image_reader.has_next():
+        del bag_reader # Clean up reader
+        raise ValueError(f'Topic "{topic_name}" seems to have no messages in the bag')
+
+    # --- Setup Video Writer --- (Adapted from create_sequential_video_writer)
+    try:
+        first_image, start_stamp = image_reader.get_next()
+    except Exception as e:
+        del bag_reader
+        raise RuntimeError(f"Error reading first image from topic '{topic_name}': {e}")
+
+    width = first_image.shape[1]
+    height = first_image.shape[0]
+    cv_video_writer = cv2.VideoWriter(
+        str(output_path), codec, fps, (width, height)) # Use integer codec directly
+
+    if not cv_video_writer.isOpened():
+        del bag_reader
+        # Try to provide a more helpful error message about the codec
+        raise ValueError(
+            f'Failed to open video writer for "{output_path}". '
+            f'Codec fourcc={codec} may not be supported for the '
+            f'container format (based on extension {output_path.suffix}) or system setup.'
+        )
+
+    video_writer = SequentialVideoWriter(cv_video_writer, first_image, start_stamp, fps)
+
+    # --- Process Messages --- 
+    print(
+        f'Writing video for topic "{topic_name}" to {output_path} at {fps} FPS '
+        f'({width}x{height})...')
+    try:
+        while image_reader.has_next():
+            try:
+                image, stamp = image_reader.get_next()
+                video_writer.add_frame(image, stamp)
+            except Exception as e:
+                 # Log error for specific message but try to continue?
+                 # Or fail fast? Let's fail fast for now.
+                 raise RuntimeError(f"Error processing message for topic '{topic_name}': {e}")
+
+    finally:
+        # Ensure resources are released even if errors occur during processing
+        video_writer.close()
+        del bag_reader # Ensure SequentialReader is destroyed before Python GC potentially closes files
 
     print(
-        f'Processed {video_writer.images_processed} messages and wrote '
-        f'{video_writer.frames_written} frames. '
-        f'{video_writer.images_skipped} messages were skipped',
-        file=sys.stderr)
-    print(f'Output video: {output_path}', file=sys.stderr)
-
-
-def main(args):
-    """
-    Create a bagfile from a video.
-
-    Wrapper of convert_bag_to_video(), that handles exceptions and prints errors instead.
-    """
-    codec = args.codec
-    if args.codec_dialog:
-        codec = -1
-    try:
-        convert_bag_to_video(
-            args.bagfile, args.storage_id, args.topic, args.output, codec, args.fps)
-    except CommandInputError as e:
-        print(e, file=sys.stderr)
-    except Exception as e:
-        print(f'Unexpected exception of type [{type(e)}]: {e}', file=sys.stderr)
+        f'Finished writing {video_writer.frames_written} frames '
+        f'({video_writer.images_processed} images processed, {video_writer.images_skipped} skipped).'
+    )
+    # Optionally return some stats or just finish

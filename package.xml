@@ -11,13 +11,21 @@
 
   <author email="ivanpauno@ekumenlabs.com">Ivan Santiago Paunovic</author>
 
-  <exec_depend>libopencv-dev</exec_depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>opencv</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>ros2bag</exec_depend>
   <exec_depend>rosbag2_py</exec_depend>
+  <exec_depend>rosbag2_storage</exec_depend>
+  <exec_depend>rosbag2_storage_sqlite3</exec_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
   <exec_depend>rosidl_runtime_py</exec_depend>
-  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>python3-pyside6</exec_depend>
+  <exec_depend>python3-qt-material</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
